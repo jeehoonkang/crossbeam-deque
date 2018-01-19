@@ -17,6 +17,7 @@ travis-ci = { repository = "crossbeam-rs/crossbeam-deque" }
 [dependencies]
 crossbeam-epoch = "0.4.0"
 crossbeam-utils = "0.2.1"
+scopeguard = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 rand = "0.4"

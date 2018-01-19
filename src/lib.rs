@@ -84,7 +84,10 @@
 
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils as utils;
+#[macro_use]
+extern crate scopeguard;
 
+use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -153,6 +156,17 @@ impl<T> Buffer<T> {
     /// Reads a value from the specified `index`.
     unsafe fn read(&self, index: isize) -> T {
         ptr::read(self.at(index))
+    }
+
+    /// Reads values from `[from, to)`.
+    unsafe fn read_range(&self, from: isize, to: isize) -> Vec<T> {
+        // FIXME(jeehoonkang): it can be much more efficient by using
+        // `std::slice::from_raw_parts()`.
+        let mut result = Vec::new();
+        for i in from..to {
+            result.push(ptr::read(self.at(i)));
+        }
+        result
     }
 }
 
@@ -304,6 +318,7 @@ impl<T> Drop for Inner<T> {
 /// [Stealer::steal]: struct.Stealer.html#method.steal
 pub struct Deque<T> {
     inner: Arc<CachePadded<Inner<T>>>,
+    bottom_max: Cell<isize>,
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
@@ -324,6 +339,7 @@ impl<T> Deque<T> {
     pub fn new() -> Deque<T> {
         Deque {
             inner: Arc::new(CachePadded::new(Inner::new())),
+            bottom_max: Cell::new(0),
             _marker: PhantomData,
         }
     }
@@ -343,6 +359,7 @@ impl<T> Deque<T> {
     pub fn with_min_capacity(min_cap: usize) -> Deque<T> {
         Deque {
             inner: Arc::new(CachePadded::new(Inner::with_min_capacity(min_cap))),
+            bottom_max: Cell::new(0),
             _marker: PhantomData,
         }
     }
@@ -421,9 +438,15 @@ impl<T> Deque<T> {
 
             // Write `value` into the right slot and increment `b`.
             buffer.deref().write(b, value);
+            let b_new = b.wrapping_add(1);
             self.inner
                 .bottom
-                .store(b.wrapping_add(1), Ordering::Release);
+                .store(b_new, Ordering::Release);
+
+            // If `bottom_max < bottom`, then `bottom_max = bottom`.
+            if self.bottom_max.get().wrapping_sub(b_new) < 0 {
+                self.bottom_max.set(b_new);
+            }
         }
     }
 
@@ -462,18 +485,6 @@ impl<T> Deque<T> {
 
         atomic::fence(Ordering::SeqCst);
 
-        // Load the top.
-        let t = self.inner.top.load(Ordering::Relaxed);
-
-        // Compute the length after the bottom was decremented.
-        let len = b.wrapping_sub(t);
-
-        if len <= 0 {
-            // The deque is empty. Restore the bottom back to the original value.
-            self.inner.bottom.store(b, Ordering::Relaxed);
-            return None;
-        }
-
         // Load the buffer. The buffer doesn't have to be epoch-protected because the current
         // thread (the worker) is the only one that grows and shrinks it.
         let buf = unsafe {
@@ -482,41 +493,65 @@ impl<T> Deque<T> {
                 .load(Ordering::Relaxed, epoch::unprotected())
         };
 
-        // Read the value to be popped.
-        let mut value = unsafe { Some(buf.deref().read(b.wrapping_sub(1))) };
+        // Load the top.
+        let mut t = self.inner.top.load(Ordering::Relaxed);
 
-        // Are we popping the last element from the deque?
-        if len == 1 {
-            // Try incrementing the top.
-            if self.inner
-                .top
-                .compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
-                .is_err()
-            {
-                // FIXME(jeehoonkang): In fact, it is sufficient to use `Acquire` for the failure
-                // ordering in the CAS above, instead of issuing an `Acquire` fence below. But in
-                // that case, the C11 standard's 7.17.7.4 paragraph 2 requires that the success
-                // ordering be `AcqRel`, presumably degrading the performance: "The failure argument
-                // shall be no stronger than the success argument." In my humble opinion, this is an
-                // unnecessary requirement, and I hope it be lifted in the future.
-                atomic::fence(Ordering::Acquire);
-                // Failed. We didn't pop anything.
-                mem::forget(value.take());
-            }
+        // Compute the maximum index that can be stolen.
+        let steal_max = t.wrapping_add(self.bottom_max.get().wrapping_add(1).wrapping_sub(t) / 2);
 
-            // Restore the bottom back to the original value.
-            self.inner.bottom.store(b, Ordering::Relaxed);
-        } else {
-            // Shrink the buffer if `len` is less than one fourth of `self.inner.min_cap`.
+        // If the last element from the bottom end is not subject to be stolen, return it.
+        if b.wrapping_sub(steal_max) > 0 {
             unsafe {
+                // Compute the length after the bottom was decremented.
+                let len = b.wrapping_sub(t);
+
+                // Shrink the buffer if `len` is less than one fourth of `self.inner.min_cap`.
                 let cap = buf.deref().cap;
                 if cap > self.inner.min_cap && len < cap as isize / 4 {
                     self.inner.resize(cap / 2);
                 }
+
+                return Some(buf.deref().read(b.wrapping_sub(1)));
             }
         }
 
-        value
+        // It is not safe to steal from the bottom end. Try to pop the first element from the top
+        // end. Regardless of whether it is successful or not, at the end, restore the bottom back
+        // to the original value.
+        defer! {
+            self.inner.bottom.store(b, Ordering::Relaxed)
+        }
+
+        while b.wrapping_sub(t) > 0 {
+            // FIXME(jeehoonkang): This CAS can be weak. Also, we can issue a `Release` fence before
+            // the while loop instead of issuing `Release` CAS every time. But we need a performance
+            // benchmark for changing it.
+            match self.inner.top.compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed) {
+                Ok(_) => {
+                    // Since the owner successfully updated `top`, set `bottom_max` as the current
+                    // value of `bottom`.
+                    self.bottom_max.set(b);
+
+                    return Some(unsafe { buf.deref().read(t) });
+                },
+                Err(t_cur) => {
+                    // FIXME(jeehoonkang): In fact, it is sufficient to use `Acquire` for the
+                    // failure ordering in the CAS above, instead of issuing an `Acquire` fence
+                    // below. But in that case, the C11 standard's 7.17.7.4 paragraph 2 requires
+                    // that the success ordering be `AcqRel`, presumably degrading the performance:
+                    // "The failure argument shall be no stronger than the success argument." In my
+                    // humble opinion, this is an unnecessary requirement, and I hope it be lifted
+                    // in the future.
+                    atomic::fence(Ordering::Acquire);
+
+                    // Retry with the recently read value from `top`.
+                    t = t_cur;
+                }
+            }
+        }
+
+        // Since `bottom <= top`, the deque is empty.
+        return None;
     }
 
     /// Steals an element from the top of the deque.
@@ -761,6 +796,81 @@ impl<T> Stealer<T> {
             Steal::Retry
         }
     }
+
+    /// Steals upto half of the elements from the top of the deque.
+    ///
+    /// Unlike most methods in concurrent data structures, if another operation gets in the way
+    /// while attempting to steal data, this method will return immediately with [`Steal::Retry`]
+    /// instead of retrying.
+    ///
+    /// This method will not attempt to resize the internal buffer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_deque::{Deque, Steal};
+    ///
+    /// let d = Deque::new();
+    /// let s = d.stealer();
+    /// d.push(1);
+    /// d.push(2);
+    ///
+    /// // Attempt to steal an element, but keep retrying if we get `Retry`.
+    /// let stolen = loop {
+    ///     match s.steal_half() {
+    ///         Steal::Empty => break None,
+    ///         Steal::Data(data) => break Some(data),
+    ///         Steal::Retry => {}
+    ///     }
+    /// };
+    /// assert_eq!(stolen, Some(vec!(1)));
+    /// ```
+    ///
+    /// [`Steal::Retry`]: enum.Steal.html#variant.Retry
+    pub fn steal_half(&self) -> Steal<Vec<T>> {
+        // Load the top.
+        let t = self.inner.top.load(Ordering::Relaxed);
+
+        // A SeqCst fence is needed here.
+        // If the current thread is already pinned (reentrantly), we must manually issue the fence.
+        // Otherwise, the following pinning will issue the fence anyway, so we don't have to.
+        if epoch::is_pinned() {
+            atomic::fence(Ordering::SeqCst);
+        }
+
+        let guard = &epoch::pin();
+
+        // Load the bottom.
+        let b = self.inner.bottom.load(Ordering::Acquire);
+
+        // Is the deque empty?
+        if b.wrapping_sub(t) <= 0 {
+            return Steal::Empty;
+        }
+
+        // Compute the maximum index that is stolen.
+        let steal_max = t.wrapping_add(b.wrapping_add(1).wrapping_sub(t) / 2);
+
+        // Load the buffer and read the data at the top.
+        let buf = self.inner.buffer.load(Ordering::Acquire, guard);
+        let values = unsafe { buf.deref().read_range(t, steal_max) };
+
+        // Try incrementing the top to steal the value.
+        //
+        // FIXME(jeehoonkang): this CAS can be weak, but we need a performance benchmark for
+        // changing it.
+        if self.inner
+            .top
+            .compare_exchange(t, steal_max, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            Steal::Data(values)
+        } else {
+            // We didn't steal this value, forget it.
+            mem::forget(values);
+            Steal::Retry
+        }
+    }
 }
 
 impl<T> Clone for Stealer<T> {
@@ -877,11 +987,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let mut last = COUNT + 1;
         while remaining.load(SeqCst) > 0 {
-            if let Some(x) = d.pop() {
-                assert!(last > *x);
-                last = *x;
+            if d.pop().is_some() {
                 remaining.fetch_sub(1, SeqCst);
             }
         }
