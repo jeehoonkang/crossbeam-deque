@@ -132,6 +132,10 @@ unsafe impl<T> Send for Buffer<T> {}
 
 impl<T> Buffer<T> {
     /// Returns a new buffer with the specified capacity.
+    ///
+    /// # Safety
+    ///
+    /// `cap` should be a power of two.
     fn new(cap: usize) -> Self {
         debug_assert_eq!(cap, cap.next_power_of_two());
 
@@ -188,26 +192,19 @@ struct Inner<T> {
 
     /// The underlying buffer.
     buffer: Atomic<Buffer<T>>,
-
-    /// Minimum capacity of the buffer. Always a power of two.
-    min_cap: usize,
 }
 
 impl<T> Inner<T> {
-    /// Returns a new `Inner` with default minimum capacity.
-    fn new() -> Self {
-        Self::with_min_capacity(DEFAULT_MIN_CAP)
-    }
-
-    /// Returns a new `Inner` with minimum capacity of `min_cap` rounded to the next power of two.
+    /// Returns a new `Inner` with minimum capacity of `min_cap`.
+    ///
+    /// # Safety
+    ///
+    /// `min_cap` should be a power of two.
     fn with_min_capacity(min_cap: usize) -> Self {
-        let power = min_cap.next_power_of_two();
-        assert!(power >= min_cap, "capacity too large: {}", min_cap);
         Inner {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
-            buffer: Atomic::new(Buffer::new(power)),
-            min_cap: power,
+            buffer: Atomic::new(Buffer::new(min_cap)),
         }
     }
 
@@ -318,7 +315,13 @@ impl<T> Drop for Inner<T> {
 /// [Stealer::steal]: struct.Stealer.html#method.steal
 pub struct Deque<T> {
     inner: Arc<CachePadded<Inner<T>>>,
-    bottom_max: Cell<isize>,
+
+    /// Minimum capacity of the buffer. Always a power of two.
+    min_cap: usize,
+
+    /// The maximum value of `bottom` after the last steal from the worker.
+    max_bottom: Cell<isize>,
+
     _marker: PhantomData<*mut ()>, // !Send + !Sync
 }
 
@@ -337,11 +340,7 @@ impl<T> Deque<T> {
     /// let d = Deque::<i32>::new();
     /// ```
     pub fn new() -> Deque<T> {
-        Deque {
-            inner: Arc::new(CachePadded::new(Inner::new())),
-            bottom_max: Cell::new(0),
-            _marker: PhantomData,
-        }
+        Self::with_min_capacity(DEFAULT_MIN_CAP)
     }
 
     /// Returns a new deque with the specified minimum capacity.
@@ -357,9 +356,12 @@ impl<T> Deque<T> {
     /// let d = Deque::<i32>::with_min_capacity(1000);
     /// ```
     pub fn with_min_capacity(min_cap: usize) -> Deque<T> {
+        let power = min_cap.next_power_of_two();
+        assert!(power >= min_cap, "capacity too large: {}", min_cap);
         Deque {
-            inner: Arc::new(CachePadded::new(Inner::with_min_capacity(min_cap))),
-            bottom_max: Cell::new(0),
+            inner: Arc::new(CachePadded::new(Inner::with_min_capacity(power))),
+            min_cap: power,
+            max_bottom: Cell::new(0),
             _marker: PhantomData,
         }
     }
@@ -423,11 +425,13 @@ impl<T> Deque<T> {
             // Calculate the length of the deque.
             let len = b.wrapping_sub(t);
 
-            // Is the deque full?
+            // Calculate the capacity of the deque.
             let mut buffer = self.inner
                 .buffer
                 .load(Ordering::Relaxed, epoch::unprotected());
             let cap = buffer.deref().cap;
+
+            // Is the deque full?
             if len >= cap as isize {
                 // Yes. Grow the underlying buffer.
                 self.inner.resize(2 * cap);
@@ -439,13 +443,11 @@ impl<T> Deque<T> {
             // Write `value` into the right slot and increment `b`.
             buffer.deref().write(b, value);
             let b_new = b.wrapping_add(1);
-            self.inner
-                .bottom
-                .store(b_new, Ordering::Release);
+            self.inner.bottom.store(b_new, Ordering::Release);
 
-            // If `bottom_max < bottom`, then `bottom_max = bottom`.
-            if self.bottom_max.get().wrapping_sub(b_new) < 0 {
-                self.bottom_max.set(b_new);
+            // If `max_bottom < bottom`, then `max_bottom = bottom`.
+            if self.max_bottom.get().wrapping_sub(b_new) < 0 {
+                self.max_bottom.set(b_new);
             }
         }
     }
@@ -497,17 +499,17 @@ impl<T> Deque<T> {
         let mut t = self.inner.top.load(Ordering::Relaxed);
 
         // Compute the maximum index that can be stolen.
-        let steal_max = t.wrapping_add(self.bottom_max.get().wrapping_add(1).wrapping_sub(t) / 2);
+        let max_steal = t.wrapping_add(self.max_bottom.get().wrapping_add(1).wrapping_sub(t) / 2);
 
         // If the last element from the bottom end is not subject to be stolen, return it.
-        if b.wrapping_sub(steal_max) > 0 {
+        if b.wrapping_sub(max_steal) > 0 {
             unsafe {
                 // Compute the length after the bottom was decremented.
                 let len = b.wrapping_sub(t);
 
                 // Shrink the buffer if `len` is less than one fourth of `self.inner.min_cap`.
                 let cap = buf.deref().cap;
-                if cap > self.inner.min_cap && len < cap as isize / 4 {
+                if cap > self.min_cap && len < cap as isize / 4 {
                     self.inner.resize(cap / 2);
                 }
 
@@ -526,32 +528,39 @@ impl<T> Deque<T> {
             // FIXME(jeehoonkang): This CAS can be weak. Also, we can issue a `Release` fence before
             // the while loop instead of issuing `Release` CAS every time. But we need a performance
             // benchmark for changing it.
-            match self.inner.top.compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed) {
+            match self.inner.top.compare_exchange(
+                t,
+                t.wrapping_add(1),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
-                    // Since the owner successfully updated `top`, set `bottom_max` as the current
+                    // Since the worker successfully updated `top`, set `max_bottom` as the current
                     // value of `bottom`.
-                    self.bottom_max.set(b);
+                    self.max_bottom.set(b);
 
                     return Some(unsafe { buf.deref().read(t) });
-                },
+                }
                 Err(t_cur) => {
-                    // FIXME(jeehoonkang): In fact, it is sufficient to use `Acquire` for the
-                    // failure ordering in the CAS above, instead of issuing an `Acquire` fence
-                    // below. But in that case, the C11 standard's 7.17.7.4 paragraph 2 requires
-                    // that the success ordering be `AcqRel`, presumably degrading the performance:
-                    // "The failure argument shall be no stronger than the success argument." In my
-                    // humble opinion, this is an unnecessary requirement, and I hope it be lifted
-                    // in the future.
-                    atomic::fence(Ordering::Acquire);
-
                     // Retry with the recently read value from `top`.
                     t = t_cur;
                 }
             }
         }
 
+        // This fence is necessary if you want to also linearize those invocations that return
+        // `Empty`.
+        //
+        // FIXME(jeehoonkang): Instead of issuing an `Acquire` fence here, we can use `Acquire` for
+        // the failure ordering in the CAS above. But in that case, the C11 standard's 7.17.7.4
+        // paragraph 2 requires that the success ordering be `AcqRel`, presumably degrading the
+        // performance: "The failure argument shall be no stronger than the success argument." In my
+        // humble opinion, this is an unnecessary requirement, and I hope it be lifted in the
+        // future.
+        atomic::fence(Ordering::Acquire);
+
         // Since `bottom <= top`, the deque is empty.
-        return None;
+        None
     }
 
     /// Steals an element from the top of the deque.
@@ -591,11 +600,14 @@ impl<T> Deque<T> {
     ///
     /// [`Steal::Retry`]: enum.Steal.html#variant.Retry
     pub fn steal(&self) -> Steal<T> {
-        let b = self.inner.bottom.load(Ordering::Relaxed);
+        // Load the top.
         let t = self.inner.top.load(Ordering::Relaxed);
-        let len = b.wrapping_sub(t);
+
+        // Load the bottom.
+        let b = self.inner.bottom.load(Ordering::Acquire);
 
         // Is the deque empty?
+        let len = b.wrapping_sub(t);
         if len <= 0 {
             return Steal::Empty;
         }
@@ -607,27 +619,27 @@ impl<T> Deque<T> {
         if self.inner
             .top
             .compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
-            .is_ok()
+            .is_err()
         {
-            let buf = unsafe {
-                self.inner
-                    .buffer
-                    .load(Ordering::Relaxed, epoch::unprotected())
-            };
-            let value = unsafe { buf.deref().read(t) };
-
-            // Shrink the buffer if `len - 1` is less than one fourth of `self.inner.min_cap`.
-            unsafe {
-                let cap = buf.deref().cap;
-                if cap > self.inner.min_cap && len <= cap as isize / 4 {
-                    self.inner.resize(cap / 2);
-                }
-            }
-
-            Steal::Data(value)
-        } else {
-            Steal::Retry
+            return Steal::Retry;
         }
+
+        let buf = unsafe { self.inner.buffer.load(Ordering::Acquire, epoch::unprotected()) };
+        let value = unsafe { buf.deref().read(t) };
+
+        // Since the worker successfully updated `top`, set `max_bottom` as the current
+        // value of `bottom`.
+        self.max_bottom.set(b);
+
+        // Shrink the buffer if `len - 1` is less than one fourth of `self.inner.min_cap`.
+        unsafe {
+            let cap = buf.deref().cap;
+            if cap > self.min_cap && len <= cap as isize / 4 {
+                self.inner.resize(cap / 2);
+            }
+        }
+
+        Steal::Data(value)
     }
 
     /// Creates a stealer that can be shared with other threads.
@@ -787,17 +799,17 @@ impl<T> Stealer<T> {
         if self.inner
             .top
             .compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
-            .is_ok()
+            .is_err()
         {
-            Steal::Data(value)
-        } else {
             // We didn't steal this value, forget it.
             mem::forget(value);
-            Steal::Retry
+            return Steal::Retry;
         }
+
+        Steal::Data(value)
     }
 
-    /// Steals upto half of the elements from the top of the deque.
+    /// Steals half of the elements from the top of the deque.
     ///
     /// Unlike most methods in concurrent data structures, if another operation gets in the way
     /// while attempting to steal data, this method will return immediately with [`Steal::Retry`]
@@ -849,11 +861,11 @@ impl<T> Stealer<T> {
         }
 
         // Compute the maximum index that is stolen.
-        let steal_max = t.wrapping_add(b.wrapping_add(1).wrapping_sub(t) / 2);
+        let max_steal = t.wrapping_add(b.wrapping_add(1).wrapping_sub(t) / 2);
 
         // Load the buffer and read the data at the top.
         let buf = self.inner.buffer.load(Ordering::Acquire, guard);
-        let values = unsafe { buf.deref().read_range(t, steal_max) };
+        let values = unsafe { buf.deref().read_range(t, max_steal) };
 
         // Try incrementing the top to steal the value.
         //
@@ -861,15 +873,15 @@ impl<T> Stealer<T> {
         // changing it.
         if self.inner
             .top
-            .compare_exchange(t, steal_max, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
+            .compare_exchange(t, max_steal, Ordering::Release, Ordering::Relaxed)
+            .is_err()
         {
-            Steal::Data(values)
-        } else {
             // We didn't steal this value, forget it.
             mem::forget(values);
-            Steal::Retry
+            return Steal::Retry;
         }
+
+        Steal::Data(values)
     }
 }
 
