@@ -66,8 +66,8 @@
 //! The implementation is based on the following work:
 //!
 //! 1. [Chase and Lev. Dynamic circular work-stealing deque. SPAA 2005.][chase-lev]
-//! 2. [Le, Pop, Cohen, and Nardelli. Correct and efficient work-stealing for weak memory models.
-//!    PPoPP 2013.][weak-mem]
+//! 2. [Le, Pop, Cohen, and Zappa Nardelli. Correct and efficient work-stealing for weak memory
+//!    models. PPoPP 2013.][weak-mem]
 //! 3. [Norris and Demsky. CDSchecker: checking concurrent data structures written with C/C++
 //!    atomics. OOPSLA 2013.][checker]
 //!
@@ -84,8 +84,6 @@
 
 extern crate crossbeam_epoch as epoch;
 extern crate crossbeam_utils as utils;
-#[macro_use]
-extern crate scopeguard;
 
 use std::cell::Cell;
 use std::fmt;
@@ -126,6 +124,38 @@ struct Buffer<T> {
 
     /// Capacity of the buffer. Always a power of two.
     cap: usize,
+}
+
+/// A macro for labeling a block.
+///
+/// # Examples
+///
+/// ```
+/// fn main() {
+///     let mut x = 0;
+///
+///     block!('l, {
+///         loop {
+///             x += 1;
+///             break 'l;
+///         }
+///         panic!();
+///     });
+///
+///     assert_eq!(x, 1);
+/// }
+/// ```
+///
+/// # Caveats
+///
+/// Currently, you cannot break the block with a value.
+macro_rules! block {
+    ($label:tt, $body:block) => ({
+        $label: loop {
+            $body;
+            break;
+        }
+    })
 }
 
 unsafe impl<T> Send for Buffer<T> {}
@@ -481,9 +511,8 @@ impl<T> Deque<T> {
         }
 
         // Decrement the bottom.
-        self.inner
-            .bottom
-            .store(b.wrapping_sub(1), Ordering::Relaxed);
+        let b_new = b.wrapping_sub(1);
+        self.inner.bottom.store(b_new, Ordering::Relaxed);
 
         atomic::fence(Ordering::SeqCst);
 
@@ -498,69 +527,83 @@ impl<T> Deque<T> {
         // Load the top.
         let mut t = self.inner.top.load(Ordering::Relaxed);
 
-        // Compute the maximum index that can be stolen.
-        let max_steal = t.wrapping_add(self.max_bottom.get().wrapping_add(1).wrapping_sub(t) / 2);
+        // Calculate the length.
+        let mut len = b.wrapping_sub(t);
 
-        // If the last element from the bottom end is not subject to be stolen, return it.
-        if b.wrapping_sub(max_steal) > 0 {
-            unsafe {
-                // Compute the length after the bottom was decremented.
-                let len = b.wrapping_sub(t);
+        block!('irregular, {
+            // Compute the maximum index that can be stolen.
+            let max_bottom = self.max_bottom.get();
+            let max_steal = t.wrapping_add(max_bottom.wrapping_add(1).wrapping_sub(t) / 2);
 
-                // Shrink the buffer if `len` is less than one fourth of `self.inner.min_cap`.
-                let cap = buf.deref().cap;
-                if cap > self.min_cap && len < cap as isize / 4 {
-                    self.inner.resize(cap / 2);
+            // If the last element is not safe to pop, try to update `max_bottom` by CASing `top`,
+            // until `2 <= len`.
+            if b.wrapping_sub(max_steal) <= 0 {
+                while 2 <= len {
+                    // FIXME(jeehoonkang): This CAS can be weak. Also, we can issue a `Release`
+                    // fence before the while loop instead of issuing `Release` CAS every time. But
+                    // we need a performance benchmark for changing it.
+                    match self.inner.top.compare_exchange(
+                        t,
+                        t,
+                        Ordering::Release,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            // Since the worker successfully updated `top`, set `max_bottom` as the
+                            // current value of `bottom`.
+                            self.max_bottom.set(b_new);
+                            break 'irregular;
+                        }
+                        Err(t_cur) => {
+                            // Retry with the recently read value from `top`.
+                            t = t_cur;
+                            len = b.wrapping_sub(t);
+                        }
+                    }
                 }
 
-                return Some(buf.deref().read(b.wrapping_sub(1)));
-            }
-        }
+                // The "irregular" path: `len <= 1`. If `len = 1`, join the race to steal from the
+                // top end. If `len <= 0` or you lost the race, return `Empty`.
+                //
+                // FIXME(jeehoonkang): In order to also linearize the `steal()` invocations that
+                // return `Empty`, the failure ordering of the CAS below should be
+                // `Acquire`. However, it doesn't seem very important to do so: if your `steal()`
+                // invocation to a deque returns `Empty`, you will probably retry.
+                if len == 1 &&
+                    self.inner.top.compare_exchange(
+                        t,
+                        t.wrapping_add(1),
+                        Ordering::Release,
+                        Ordering::Relaxed).is_ok()
+                {
+                    // Restore the bottom back to the original value at the end.
+                    self.inner.bottom.store(b, Ordering::Relaxed);
 
-        // It is not safe to steal from the bottom end. Try to pop the first element from the top
-        // end. Regardless of whether it is successful or not, at the end, restore the bottom back
-        // to the original value.
-        defer! {
-            self.inner.bottom.store(b, Ordering::Relaxed)
-        }
-
-        while b.wrapping_sub(t) > 0 {
-            // FIXME(jeehoonkang): This CAS can be weak. Also, we can issue a `Release` fence before
-            // the while loop instead of issuing `Release` CAS every time. But we need a performance
-            // benchmark for changing it.
-            match self.inner.top.compare_exchange(
-                t,
-                t.wrapping_add(1),
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
                     // Since the worker successfully updated `top`, set `max_bottom` as the current
                     // value of `bottom`.
                     self.max_bottom.set(b);
 
                     return Some(unsafe { buf.deref().read(t) });
                 }
-                Err(t_cur) => {
-                    // Retry with the recently read value from `top`.
-                    t = t_cur;
-                }
+
+                // Restore the bottom back to the original value at the end.
+                self.inner.bottom.store(b, Ordering::Relaxed);
+
+                // Since `bottom <= top`, the deque is empty.
+                return None;
             }
+        });
+
+        // The "regular" path: `steal_max < b`. It is safe to pop from the bottom end.
+        unsafe {
+            // Shrink the buffer if its length is less than one fourth of its capacity.
+            let cap = buf.deref().cap;
+            if cap > self.min_cap && len < cap as isize / 4 {
+                self.inner.resize(cap / 2);
+            }
+
+            Some(buf.deref().read(b_new))
         }
-
-        // This fence is necessary if you want to also linearize those invocations that return
-        // `Empty`.
-        //
-        // FIXME(jeehoonkang): Instead of issuing an `Acquire` fence here, we can use `Acquire` for
-        // the failure ordering in the CAS above. But in that case, the C11 standard's 7.17.7.4
-        // paragraph 2 requires that the success ordering be `AcqRel`, presumably degrading the
-        // performance: "The failure argument shall be no stronger than the success argument." In my
-        // humble opinion, this is an unnecessary requirement, and I hope it be lifted in the
-        // future.
-        atomic::fence(Ordering::Acquire);
-
-        // Since `bottom <= top`, the deque is empty.
-        None
     }
 
     /// Steals an element from the top of the deque.
@@ -624,7 +667,11 @@ impl<T> Deque<T> {
             return Steal::Retry;
         }
 
-        let buf = unsafe { self.inner.buffer.load(Ordering::Acquire, epoch::unprotected()) };
+        let buf = unsafe {
+            self.inner
+                .buffer
+                .load(Ordering::Acquire, epoch::unprotected())
+        };
         let value = unsafe { buf.deref().read(t) };
 
         // Since the worker successfully updated `top`, set `max_bottom` as the current
