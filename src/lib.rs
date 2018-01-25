@@ -518,16 +518,17 @@ impl<T> Deque<T> {
 
         // Load the buffer. The buffer doesn't have to be epoch-protected because the current
         // thread (the worker) is the only one that grows and shrinks it.
-        let buf = unsafe {
+        let buffer = unsafe {
             self.inner
                 .buffer
                 .load(Ordering::Relaxed, epoch::unprotected())
         };
+        let cap = unsafe { buffer.deref().cap };
 
         // Load the top.
         let mut t = self.inner.top.load(Ordering::Relaxed);
 
-        // Calculate the length.
+        // Calculate the length of the deque.
         let mut len = b.wrapping_sub(t);
 
         block!('irregular, {
@@ -544,13 +545,15 @@ impl<T> Deque<T> {
                     // we need a performance benchmark for changing it.
                     match self.inner.top.compare_exchange(
                         t,
-                        t,
+                        t.wrapping_add(2 * cap as isize),
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
                         Ok(_) => {
                             // Since the worker successfully updated `top`, set `max_bottom` as the
                             // current value of `bottom`.
+                            let b_new = b_new.wrapping_add(2 * cap as isize);
+                            self.inner.bottom.store(b_new, Ordering::Relaxed);
                             self.max_bottom.set(b_new);
                             break 'irregular;
                         }
@@ -563,7 +566,7 @@ impl<T> Deque<T> {
                 }
 
                 // The "irregular" path: `len <= 1`. If `len = 1`, join the race to steal from the
-                // top end. If `len <= 0` or you lost the race, return `Empty`.
+                // top end. If `len <= 0` or you lost the race, the deque is empty.
                 //
                 // FIXME(jeehoonkang): In order to also linearize the `steal()` invocations that
                 // return `Empty`, the failure ordering of the CAS below should be
@@ -583,7 +586,7 @@ impl<T> Deque<T> {
                     // value of `bottom`.
                     self.max_bottom.set(b);
 
-                    return Some(unsafe { buf.deref().read(t) });
+                    return Some(unsafe { buffer.deref().read(t) });
                 }
 
                 // Restore the bottom back to the original value at the end.
@@ -597,12 +600,11 @@ impl<T> Deque<T> {
         // The "regular" path: `steal_max < b`. It is safe to pop from the bottom end.
         unsafe {
             // Shrink the buffer if its length is less than one fourth of its capacity.
-            let cap = buf.deref().cap;
             if cap > self.min_cap && len < cap as isize / 4 {
                 self.inner.resize(cap / 2);
             }
 
-            Some(buf.deref().read(b_new))
+            Some(buffer.deref().read(b_new))
         }
     }
 
@@ -649,8 +651,10 @@ impl<T> Deque<T> {
         // Load the bottom.
         let b = self.inner.bottom.load(Ordering::Acquire);
 
-        // Is the deque empty?
+        // Calculate the length of the deque.
         let len = b.wrapping_sub(t);
+
+        // Is the deque empty?
         if len <= 0 {
             return Steal::Empty;
         }
@@ -667,12 +671,12 @@ impl<T> Deque<T> {
             return Steal::Retry;
         }
 
-        let buf = unsafe {
+        let buffer = unsafe {
             self.inner
                 .buffer
                 .load(Ordering::Acquire, epoch::unprotected())
         };
-        let value = unsafe { buf.deref().read(t) };
+        let value = unsafe { buffer.deref().read(t) };
 
         // Since the worker successfully updated `top`, set `max_bottom` as the current
         // value of `bottom`.
@@ -680,7 +684,7 @@ impl<T> Deque<T> {
 
         // Shrink the buffer if `len - 1` is less than one fourth of `self.inner.min_cap`.
         unsafe {
-            let cap = buf.deref().cap;
+            let cap = buffer.deref().cap;
             if cap > self.min_cap && len <= cap as isize / 4 {
                 self.inner.resize(cap / 2);
             }
@@ -830,14 +834,23 @@ impl<T> Stealer<T> {
         // Load the bottom.
         let b = self.inner.bottom.load(Ordering::Acquire);
 
+        // Calculate the length of the deque.
+        let len = b.wrapping_sub(t);
+
+        // If we read inconsistent values of `top` and `bottom` due to `pop()` incrementing `top` by
+        // two times the buffer size, retry.
+        if len < -1 {
+            return Steal::Retry;
+        }
+
         // Is the deque empty?
-        if b.wrapping_sub(t) <= 0 {
+        if len <= 0 {
             return Steal::Empty;
         }
 
         // Load the buffer and read the data at the top.
-        let buf = self.inner.buffer.load(Ordering::Acquire, guard);
-        let value = unsafe { buf.deref().read(t) };
+        let buffer = self.inner.buffer.load(Ordering::Acquire, guard);
+        let value = unsafe { buffer.deref().read(t) };
 
         // Try incrementing the top to steal the value.
         //
@@ -902,8 +915,17 @@ impl<T> Stealer<T> {
         // Load the bottom.
         let b = self.inner.bottom.load(Ordering::Acquire);
 
+        // Calculate the length of the deque.
+        let len = b.wrapping_sub(t);
+
+        // If we read inconsistent values of `top` and `bottom` due to `pop()` incrementing `top` by
+        // two times the buffer size, retry.
+        if len < -1 {
+            return Steal::Retry;
+        }
+
         // Is the deque empty?
-        if b.wrapping_sub(t) <= 0 {
+        if len <= 0 {
             return Steal::Empty;
         }
 
@@ -911,8 +933,8 @@ impl<T> Stealer<T> {
         let max_steal = t.wrapping_add(b.wrapping_add(1).wrapping_sub(t) / 2);
 
         // Load the buffer and read the data at the top.
-        let buf = self.inner.buffer.load(Ordering::Acquire, guard);
-        let values = unsafe { buf.deref().read_range(t, max_steal) };
+        let buffer = self.inner.buffer.load(Ordering::Acquire, guard);
+        let values = unsafe { buffer.deref().read_range(t, max_steal) };
 
         // Try incrementing the top to steal the value.
         //
@@ -1046,8 +1068,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
+        let mut last = COUNT + 1;
         while remaining.load(SeqCst) > 0 {
-            if d.pop().is_some() {
+            if let Some(x) = d.pop() {
+                assert!(last > *x);
+                last = *x;
                 remaining.fetch_sub(1, SeqCst);
             }
         }
