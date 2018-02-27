@@ -98,7 +98,7 @@ use epoch::{Atomic, Owned};
 use utils::cache_padded::CachePadded;
 
 /// Minimum buffer capacity for a deque.
-const DEFAULT_MIN_CAP: usize = 16;
+const DEFAULT_MIN_CAP: usize = 1 << 4;
 
 /// If a buffer of at least this size is retired, thread-local garbage is flushed so that it gets
 /// deallocated as soon as possible.
@@ -153,7 +153,8 @@ macro_rules! block {
     ($label:tt, $body:block) => ({
         $label: loop {
             $body;
-            break;
+            #[allow(unreachable_code)]
+            { break; }
         }
     })
 }
@@ -197,8 +198,10 @@ impl<T> Buffer<T> {
         // FIXME(jeehoonkang): it can be much more efficient by using
         // `std::slice::from_raw_parts()`.
         let mut result = Vec::new();
-        for i in from..to {
+        let mut i = from;
+        while i != to {
             result.push(ptr::read(self.at(i)));
+            i = i.wrapping_add(1);
         }
         result
     }
@@ -230,11 +233,11 @@ impl<T> Inner<T> {
     /// # Safety
     ///
     /// `min_cap` should be a power of two.
-    fn with_min_capacity(min_cap: usize) -> Self {
+    fn with_capacity(cap: usize) -> Self {
         Inner {
             bottom: AtomicIsize::new(0),
             top: AtomicIsize::new(0),
-            buffer: Atomic::new(Buffer::new(min_cap)),
+            buffer: Atomic::new(Buffer::new(cap)),
         }
     }
 
@@ -389,7 +392,7 @@ impl<T> Deque<T> {
         let power = min_cap.next_power_of_two();
         assert!(power >= min_cap, "capacity too large: {}", min_cap);
         Deque {
-            inner: Arc::new(CachePadded::new(Inner::with_min_capacity(power))),
+            inner: Arc::new(CachePadded::new(Inner::with_capacity(power))),
             min_cap: power,
             max_bottom: Cell::new(0),
             _marker: PhantomData,
@@ -426,9 +429,9 @@ impl<T> Deque<T> {
     /// assert_eq!(d.len(), 3);
     /// ```
     pub fn len(&self) -> usize {
-        let b = self.inner.bottom.load(Ordering::Relaxed);
         let t = self.inner.top.load(Ordering::Relaxed);
-        b.wrapping_sub(t) as usize
+        let b = self.inner.bottom.load(Ordering::Relaxed);
+        b.wrapping_sub(t).max(0) as usize
     }
 
     /// Pushes an element into the bottom of the deque.
@@ -461,9 +464,8 @@ impl<T> Deque<T> {
                 .load(Ordering::Relaxed, epoch::unprotected());
             let cap = buffer.deref().cap;
 
-            // Is the deque full?
+            // If the deque is full, grow the underlying buffer.
             if len >= cap as isize {
-                // Yes. Grow the underlying buffer.
                 self.inner.resize(2 * cap);
                 buffer = self.inner
                     .buffer
@@ -475,8 +477,8 @@ impl<T> Deque<T> {
             let b_new = b.wrapping_add(1);
             self.inner.bottom.store(b_new, Ordering::Release);
 
-            // If `max_bottom < bottom`, then `max_bottom = bottom`.
-            if self.max_bottom.get().wrapping_sub(b_new) < 0 {
+            // If `max_bottom < bottom`, then set `max_bottom = bottom`.
+            if (self.max_bottom.get().wrapping_sub(b_new) as isize) < 0 {
                 self.max_bottom.set(b_new);
             }
         }
@@ -536,65 +538,72 @@ impl<T> Deque<T> {
             let max_bottom = self.max_bottom.get();
             let max_steal = t.wrapping_add(max_bottom.wrapping_add(1).wrapping_sub(t) / 2);
 
-            // If the last element is not safe to pop, try to update `max_bottom` by CASing `top`,
-            // until `2 <= len`.
-            if b.wrapping_sub(max_steal) <= 0 {
-                while 2 <= len {
-                    // FIXME(jeehoonkang): This CAS can be weak. Also, we can issue a `Release`
-                    // fence before the while loop instead of issuing `Release` CAS every time. But
-                    // we need a performance benchmark for changing it.
-                    match self.inner.top.compare_exchange(
-                        t,
-                        t.wrapping_add(2 * cap as isize),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => {
-                            // Since the worker successfully updated `top`, set `max_bottom` as the
-                            // current value of `bottom`.
-                            let b_new = b_new.wrapping_add(2 * cap as isize);
-                            self.inner.bottom.store(b_new, Ordering::Relaxed);
-                            self.max_bottom.set(b_new);
-                            break 'irregular;
-                        }
-                        Err(t_cur) => {
-                            // Retry with the recently read value from `top`.
-                            t = t_cur;
-                            len = b.wrapping_sub(t);
-                        }
+            // If the last element is safe to pop, go to the regular path.
+            if b.wrapping_sub(max_steal) > 0 {
+                break 'irregular;
+            }
+
+            // Concurrent stealers may steal the last element. Try to make a fresh consensus on
+            // `bottom` with stealers by updating `top`. Concretely:
+            //
+            // - Atomically adds to `top` two times the length of the buffer. Note that the
+            //   physical index in the buffer doesn't change.
+            // - Adds to `bottom` the same amount.
+            // - Sets `max_bottom` as the current value of `bottom`. It is safe because later
+            //   stealers have to see it.
+            // - Goes to the regular path.
+            while 2 <= len {
+                // FIXME(jeehoonkang): We can issue a `Release` fence before the while loop instead
+                // of issuing `Release` CAS every time. We need a performance benchmark for
+                // measuring its efficiency.
+                match self.inner.top.compare_exchange_weak(
+                    t,
+                    t.wrapping_add(2 * cap as isize),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        let b_new = b_new.wrapping_add(2 * cap as isize);
+                        self.inner.bottom.store(b_new, Ordering::Relaxed);
+                        self.max_bottom.set(b_new);
+                        break 'irregular;
+                    }
+                    Err(t_cur) => {
+                        // Retry with a more recent value from `top`.
+                        t = t_cur;
+                        len = b.wrapping_sub(t);
                     }
                 }
+            }
 
-                // The "irregular" path: `len <= 1`. If `len = 1`, join the race to steal from the
-                // top end. If `len <= 0` or you lost the race, the deque is empty.
-                //
-                // FIXME(jeehoonkang): In order to also linearize the `steal()` invocations that
-                // return `Empty`, the failure ordering of the CAS below should be
-                // `Acquire`. However, it doesn't seem very important to do so: if your `steal()`
-                // invocation to a deque returns `Empty`, you will probably retry.
-                if len == 1 &&
-                    self.inner.top.compare_exchange(
-                        t,
-                        t.wrapping_add(1),
-                        Ordering::Release,
-                        Ordering::Relaxed).is_ok()
-                {
-                    // Restore the bottom back to the original value at the end.
-                    self.inner.bottom.store(b, Ordering::Relaxed);
-
-                    // Since the worker successfully updated `top`, set `max_bottom` as the current
-                    // value of `bottom`.
-                    self.max_bottom.set(b);
-
-                    return Some(unsafe { buffer.deref().read(t) });
-                }
-
+            // The "irregular" path: `len <= 1`. If `len = 1`, join the race to steal from the top
+            // end. If `len <= 0` or you lost the race, the deque is empty.
+            //
+            // FIXME(jeehoonkang): In order to also linearize the `steal()` invocations that return
+            // `Empty`, the failure ordering of the CAS below should be `Acquire`. However, it
+            // doesn't seem very important to do so: if your `steal()` invocation to a deque returns
+            // `Empty`, you will probably retry.
+            if len == 1 &&
+                self.inner.top.compare_exchange(
+                    t,
+                    t.wrapping_add(1),
+                    Ordering::Release,
+                    Ordering::Relaxed).is_ok()
+            {
                 // Restore the bottom back to the original value at the end.
                 self.inner.bottom.store(b, Ordering::Relaxed);
 
-                // Since `bottom <= top`, the deque is empty.
-                return None;
+                // Since the worker successfully updated `top`, set `max_bottom` as the current
+                // value of `bottom`.
+                self.max_bottom.set(b);
+
+                return Some(unsafe { buffer.deref().read(t) });
             }
+
+            // Since `bottom <= top`, the deque is empty. Restore the bottom back to the original
+            // value at the end, and return `None`.
+            self.inner.bottom.store(b, Ordering::Relaxed);
+            return None;
         });
 
         // The "regular" path: `steal_max < b`. It is safe to pop from the bottom end.
@@ -659,13 +668,10 @@ impl<T> Deque<T> {
             return Steal::Empty;
         }
 
-        // Try incrementing the top to steal the value.
-        //
-        // FIXME(jeehoonkang): this CAS can be weak, but we need a performance benchmark for
-        // changing it.
+        // Try to increment `top` to steal the value.
         if self.inner
             .top
-            .compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
+            .compare_exchange_weak(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
             return Steal::Retry;
@@ -835,12 +841,12 @@ impl<T> Stealer<T> {
         let b = self.inner.bottom.load(Ordering::Acquire);
 
         // Calculate the length of the deque.
-        let len = b.wrapping_sub(t);
+        let mut len = b.wrapping_sub(t);
 
-        // If we read inconsistent values of `top` and `bottom` due to `pop()` incrementing `top` by
-        // two times the buffer size, retry.
+        // If we observed the anomaly caused by `pop()`, adjust the value of `len`.
         if len < -1 {
-            return Steal::Retry;
+            let delta = (-len as usize + 1).next_power_of_two() as isize;
+            len = len.wrapping_add(delta);
         }
 
         // Is the deque empty?
@@ -852,16 +858,13 @@ impl<T> Stealer<T> {
         let buffer = self.inner.buffer.load(Ordering::Acquire, guard);
         let value = unsafe { buffer.deref().read(t) };
 
-        // Try incrementing the top to steal the value.
-        //
-        // FIXME(jeehoonkang): this CAS can be weak, but we need a performance benchmark for
-        // changing it.
+        // Try to increment `top` to steal the value.
         if self.inner
             .top
-            .compare_exchange(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
+            .compare_exchange_weak(t, t.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
-            // We didn't steal this value, forget it.
+            // We didn't steal this value. Forget it.
             mem::forget(value);
             return Steal::Retry;
         }
@@ -916,12 +919,12 @@ impl<T> Stealer<T> {
         let b = self.inner.bottom.load(Ordering::Acquire);
 
         // Calculate the length of the deque.
-        let len = b.wrapping_sub(t);
+        let mut len = b.wrapping_sub(t);
 
-        // If we read inconsistent values of `top` and `bottom` due to `pop()` incrementing `top` by
-        // two times the buffer size, retry.
+        // If we observed the anomaly caused by `pop()`, adjust the value of `len`.
         if len < -1 {
-            return Steal::Retry;
+            let delta = (-len as usize + 1).next_power_of_two() as isize;
+            len = len.wrapping_add(delta);
         }
 
         // Is the deque empty?
@@ -929,23 +932,20 @@ impl<T> Stealer<T> {
             return Steal::Empty;
         }
 
-        // Compute the maximum index that is stolen.
+        // Compute the maximum index that can be stolen.
         let max_steal = t.wrapping_add(b.wrapping_add(1).wrapping_sub(t) / 2);
 
         // Load the buffer and read the data at the top.
         let buffer = self.inner.buffer.load(Ordering::Acquire, guard);
         let values = unsafe { buffer.deref().read_range(t, max_steal) };
 
-        // Try incrementing the top to steal the value.
-        //
-        // FIXME(jeehoonkang): this CAS can be weak, but we need a performance benchmark for
-        // changing it.
+        // Try to increment `top` to steal the values.
         if self.inner
             .top
-            .compare_exchange(t, max_steal, Ordering::Release, Ordering::Relaxed)
+            .compare_exchange_weak(t, max_steal, Ordering::Release, Ordering::Relaxed)
             .is_err()
         {
-            // We didn't steal this value, forget it.
+            // We didn't steal this value. Forget it.
             mem::forget(values);
             return Steal::Retry;
         }
