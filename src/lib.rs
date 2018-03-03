@@ -843,7 +843,7 @@ impl<T> Stealer<T> {
         // Calculate the length of the deque.
         let mut len = b.wrapping_sub(t);
 
-        // If we observed the anomaly caused by `pop()`, adjust the value of `len`.
+        // If we observed the anomaly caused by `pop()`. Adjust the value of `len`.
         if len < -1 {
             let delta = (-len as usize + 1).next_power_of_two() as isize;
             len = len.wrapping_add(delta);
@@ -872,7 +872,7 @@ impl<T> Stealer<T> {
         Steal::Data(value)
     }
 
-    /// Steals half of the elements from the top of the deque.
+    /// Steals up to half the elements from the top of the deque.
     ///
     /// Unlike most methods in concurrent data structures, if another operation gets in the way
     /// while attempting to steal data, this method will return immediately with [`Steal::Retry`]
@@ -892,7 +892,7 @@ impl<T> Stealer<T> {
     ///
     /// // Attempt to steal an element, but keep retrying if we get `Retry`.
     /// let stolen = loop {
-    ///     match s.steal_half() {
+    ///     match s.steal_many() {
     ///         Steal::Empty => break None,
     ///         Steal::Data(data) => break Some(data),
     ///         Steal::Retry => {}
@@ -902,7 +902,7 @@ impl<T> Stealer<T> {
     /// ```
     ///
     /// [`Steal::Retry`]: enum.Steal.html#variant.Retry
-    pub fn steal_half(&self) -> Steal<Vec<T>> {
+    pub fn steal_many(&self) -> Steal<Vec<T>> {
         // Load the top.
         let t = self.inner.top.load(Ordering::Relaxed);
 
@@ -921,7 +921,7 @@ impl<T> Stealer<T> {
         // Calculate the length of the deque.
         let mut len = b.wrapping_sub(t);
 
-        // If we observed the anomaly caused by `pop()`, adjust the value of `len`.
+        // If we observed the anomaly caused by `pop()`. Adjust the value of `len`.
         if len < -1 {
             let delta = (-len as usize + 1).next_power_of_two() as isize;
             len = len.wrapping_add(delta);
