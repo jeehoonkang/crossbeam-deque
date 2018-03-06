@@ -484,6 +484,60 @@ impl<T> Deque<T> {
         }
     }
 
+    /// Pushes elements into the bottom of the deque.
+    ///
+    /// If the internal buffer is not big enough, a new one with the capacity of the next power of
+    /// two of the new size will be allocated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_deque::Deque;
+    ///
+    /// let d = Deque::new();
+    /// d.push_many(vec![1, 2]);
+    /// d.push_many(vec![3, 4]);
+    /// ```
+    pub fn push_many(&self, values: Vec<T>) {
+        unsafe {
+            // Load the bottom, top, and buffer. The buffer doesn't have to be epoch-protected
+            // because the current thread (the worker) is the only one that grows and shrinks it.
+            let b = self.inner.bottom.load(Ordering::Relaxed);
+            let t = self.inner.top.load(Ordering::Acquire);
+
+            // Calculate the length of the deque.
+            let len = b.wrapping_sub(t);
+            let len_values = values.len() as isize;
+            let len_new = len + len_values;
+
+            // Calculate the capacity of the deque.
+            let mut buffer = self.inner
+                .buffer
+                .load(Ordering::Relaxed, epoch::unprotected());
+            let cap = buffer.deref().cap;
+
+            // If the deque is full, grow the underlying buffer.
+            if len_new > cap as isize {
+                self.inner.resize((len_new as usize).next_power_of_two() as usize);
+                buffer = self.inner
+                    .buffer
+                    .load(Ordering::Relaxed, epoch::unprotected());
+            }
+
+            // Write `value` into the right slot and increment `b`.
+            for (i, value) in values.into_iter().enumerate() {
+                buffer.deref().write(b + i as isize, value);
+            }
+            let b_new = b.wrapping_add(len_values);
+            self.inner.bottom.store(b_new, Ordering::Release);
+
+            // If `max_bottom < bottom`, then set `max_bottom = bottom`.
+            if (self.max_bottom.get().wrapping_sub(b_new) as isize) < 0 {
+                self.max_bottom.set(b_new);
+            }
+        }
+    }
+
     /// Pops an element from the bottom of the deque.
     ///
     /// If the internal buffer is less than a quarter full, a new buffer half the capacity of the
@@ -1037,6 +1091,36 @@ mod tests {
             d.push(i);
         }
         t.join().unwrap();
+    }
+
+    #[test]
+    fn push_many() {
+        let d = Deque::new();
+        let s = d.stealer();
+        assert_eq!(d.pop(), None);
+        assert_eq!(s.steal(), Steal::Empty);
+        assert_eq!(d.len(), 0);
+        assert_eq!(s.len(), 0);
+
+        d.push_many(vec![1]);
+        assert_eq!(d.len(), 1);
+        assert_eq!(s.len(), 1);
+        assert_eq!(d.pop(), Some(1));
+        assert_eq!(d.pop(), None);
+        assert_eq!(s.steal(), Steal::Empty);
+        assert_eq!(d.len(), 0);
+        assert_eq!(s.len(), 0);
+
+        d.push_many(vec![2]);
+        assert_eq!(s.steal(), Steal::Data(2));
+        assert_eq!(s.steal(), Steal::Empty);
+        assert_eq!(d.pop(), None);
+
+        d.push_many(vec![3, 4, 5]);
+        assert_eq!(d.steal(), Steal::Data(3));
+        assert_eq!(s.steal(), Steal::Data(4));
+        assert_eq!(d.steal(), Steal::Data(5));
+        assert_eq!(d.steal(), Steal::Empty);
     }
 
     #[test]
